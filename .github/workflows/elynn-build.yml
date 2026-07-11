@@ -1,0 +1,261 @@
+name: Elynn Android Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Build mode
+        required: true
+        default: release
+        type: choice
+        options: [debug, release, profile]
+      output:
+        description: Output format
+        required: true
+        default: apk
+        type: choice
+        options: [apk, aab, splitApk]
+      app_name:
+        required: true
+        default: Elynn App
+      package_name:
+        required: true
+        default: com.example.elynnapp
+      version_name:
+        required: true
+        default: 1.0.0
+      version_code:
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Download source archive
+        run: |
+          rm -rf workspace project.zip
+          gh release download elynn-source --pattern project.zip --clobber
+          mkdir workspace
+          unzip -q project.zip -d workspace
+
+      - name: Locate Android project
+        id: locate
+        shell: bash
+        run: |
+          FLUTTER_DIR=$(find workspace -name pubspec.yaml -not -path '*/.dart_tool/*' -printf '%h\n' | head -n 1)
+          if [ -n "$FLUTTER_DIR" ]; then
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+            echo "dir=$FLUTTER_DIR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          WRAPPER=$(find workspace -name gradlew -not -path '*/build/*' | head -n 1)
+          if [ -n "$WRAPPER" ]; then
+            echo "type=android" >> "$GITHUB_OUTPUT"
+            echo "dir=$(dirname "$WRAPPER")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SETTINGS=$(find workspace \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/build/*' | head -n 1)
+          if [ -n "$SETTINGS" ]; then
+            echo "type=android" >> "$GITHUB_OUTPUT"
+            echo "dir=$(dirname "$SETTINGS")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "No Flutter or Gradle Android project found in project.zip" >&2
+          exit 1
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        if: steps.locate.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Complete Flutter Android scaffold
+        if: steps.locate.outputs.type == 'flutter'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          if [ ! -f android/gradlew ]; then
+            flutter create --platforms=android .
+          fi
+
+      - name: Apply Elynn Android configuration
+        working-directory: ${{ steps.locate.outputs.dir }}
+        env:
+          PROJECT_TYPE: ${{ steps.locate.outputs.type }}
+        shell: bash
+        run: |
+          python3 - <<'PYCONFIG'
+          import json, os, pathlib, re, shutil
+
+          root = pathlib.Path('.')
+          config_path = root / '.elynn' / 'build.json'
+          if not config_path.exists():
+              print('No .elynn/build.json; keeping project defaults.')
+              raise SystemExit(0)
+
+          cfg = json.loads(config_path.read_text(encoding='utf-8'))
+          app_name = str(cfg.get('appName') or 'Elynn App')
+          package = str(cfg.get('packageName') or 'com.example.elynnapp')
+          min_sdk = int(cfg.get('minSdk') or 24)
+          target_sdk = int(cfg.get('targetSdk') or 35)
+          permissions = [str(x) for x in cfg.get('permissions', [])]
+          project_type = os.environ.get('PROJECT_TYPE', 'flutter')
+
+          def xml_escape(value):
+              return (value.replace('&', '&amp;').replace('<', '&lt;')
+                           .replace('>', '&gt;').replace('"', '&quot;'))
+
+          manifests = [p for p in root.rglob('src/main/AndroidManifest.xml') if '/build/' not in p.as_posix()]
+          for manifest in manifests:
+              text = manifest.read_text(encoding='utf-8')
+              safe_name = xml_escape(app_name)
+              if re.search(r'android:label="[^"]*"', text):
+                  text = re.sub(r'android:label="[^"]*"', f'android:label="{safe_name}"', text, count=1)
+              else:
+                  text = text.replace('<application', f'<application android:label="{safe_name}"', 1)
+              if 'android:icon=' not in text:
+                  text = text.replace('<application', '<application android:icon="@mipmap/ic_launcher"', 1)
+              additions = []
+              for item in permissions:
+                  full = item if item.startswith('android.permission.') else f'android.permission.{item}'
+                  if full not in text:
+                      additions.append(f'    <uses-permission android:name="{full}" />')
+              if additions:
+                  text = text.replace('<application', '\n'.join(additions) + '\n    <application', 1)
+              manifest.write_text(text, encoding='utf-8')
+
+          gradles = [p for p in root.rglob('build.gradle*') if '/build/' not in p.as_posix()]
+          app_gradles = []
+          for gradle in gradles:
+              text = gradle.read_text(encoding='utf-8')
+              if 'com.android.application' not in text and 'applicationId' not in text:
+                  continue
+              app_gradles.append(gradle)
+              is_kts = gradle.suffix == '.kts'
+              app_id = f'applicationId = "{package}"' if is_kts else f'applicationId "{package}"'
+              min_value = f'minSdk = {min_sdk}' if is_kts else f'minSdk {min_sdk}'
+              target_value = f'targetSdk = {target_sdk}' if is_kts else f'targetSdk {target_sdk}'
+              text = re.sub(r'applicationId\s*(?:=\s*)?["\'][^"\']+["\']', app_id, text)
+              text = re.sub(r'minSdk(?:Version)?\s*(?:=\s*)?\d+', min_value, text)
+              text = re.sub(r'targetSdk(?:Version)?\s*(?:=\s*)?\d+', target_value, text)
+              if project_type == 'flutter':
+                  namespace_value = f'namespace = "{package}"' if is_kts else f'namespace "{package}"'
+                  text = re.sub(r'namespace\s*(?:=\s*)?["\'][^"\']+["\']', namespace_value, text)
+              gradle.write_text(text, encoding='utf-8')
+
+          if project_type == 'flutter':
+              java_root = root / 'android' / 'app' / 'src' / 'main'
+              activities = list(java_root.rglob('MainActivity.kt')) + list(java_root.rglob('MainActivity.java'))
+              if activities:
+                  main_activity = activities[0]
+                  text = main_activity.read_text(encoding='utf-8')
+                  text = re.sub(r'^package\s+[\w.]+', f'package {package}', text, count=1, flags=re.M)
+                  suffix = main_activity.suffix
+                  language_dir = 'kotlin' if suffix == '.kt' else 'java'
+                  target = java_root / language_dir / pathlib.Path(*package.split('.')) / f'MainActivity{suffix}'
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_text(text, encoding='utf-8')
+                  if target.resolve() != main_activity.resolve():
+                      main_activity.unlink(missing_ok=True)
+
+          icon = root / '.elynn' / 'app_icon.png'
+          if icon.exists():
+              resource_roots = []
+              for gradle in app_gradles:
+                  candidate = gradle.parent / 'src' / 'main' / 'res'
+                  if candidate.exists() or gradle.parent.name == 'app':
+                      resource_roots.append(candidate)
+              if not resource_roots and project_type == 'flutter':
+                  resource_roots = [root / 'android' / 'app' / 'src' / 'main' / 'res']
+              for res in resource_roots:
+                  for density in ('mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi'):
+                      folder = res / f'mipmap-{density}'
+                      folder.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(icon, folder / 'ic_launcher.png')
+
+          print(f'Applied app={app_name}, package={package}, permissions={len(permissions)}')
+          PYCONFIG
+
+      - name: Resolve Flutter packages
+        if: steps.locate.outputs.type == 'flutter'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          flutter pub get
+          dart analyze --fatal-infos || true
+
+      - name: Prepare native Android wrapper
+        if: steps.locate.outputs.type == 'android'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          if [ ! -f gradlew ]; then
+            echo "Native Android project has no Gradle wrapper." >&2
+            exit 1
+          fi
+          chmod +x gradlew
+
+      - name: Build Flutter artifact
+        if: steps.locate.outputs.type == 'flutter'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          MODE="--${{ inputs.build_mode }}"
+          case "${{ inputs.output }}" in
+            aab) flutter build appbundle "$MODE" --build-name "${{ inputs.version_name }}" --build-number "${{ inputs.version_code }}" ;;
+            splitApk) flutter build apk "$MODE" --split-per-abi --build-name "${{ inputs.version_name }}" --build-number "${{ inputs.version_code }}" ;;
+            *) flutter build apk "$MODE" --build-name "${{ inputs.version_name }}" --build-number "${{ inputs.version_code }}" ;;
+          esac
+
+      - name: Build native Android artifact
+        if: steps.locate.outputs.type == 'android'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          MODE="${{ inputs.build_mode }}"
+          if [ "$MODE" = "profile" ]; then MODE="debug"; fi
+          MODE="${MODE^}"
+          if [ "${{ inputs.output }}" = "aab" ]; then
+            ./gradlew "bundle$MODE" --stacktrace
+          else
+            ./gradlew "assemble$MODE" --stacktrace
+          fi
+
+      - name: Collect output
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          mkdir -p elynn-output
+          find . -path '*/build/outputs/*' -type f \( -name '*.apk' -o -name '*.aab' \) -exec cp {} elynn-output/ \;
+          find elynn-output -maxdepth 1 -type f -print
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-${{ inputs.version_name }}
+          path: ${{ steps.locate.outputs.dir }}/elynn-output/*
+          if-no-files-found: error
+          retention-days: 7
